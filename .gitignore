@@ -1,0 +1,6 @@
+cache/
+results/
+debug/
+__pycache__/
+*.pyc
+yolov8n.pt
