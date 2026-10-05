@@ -8,7 +8,9 @@ from PIL import Image
 from pathlib import Path
 
 MODEL_REPO = "BVRA/MegaDescriptor-L-384"
-MODEL_NAME = f"hf-hub:{MODEL_REPO}"
+# Pinned commit so a changed upstream repo can't swap the weights
+MODEL_REVISION = "33b3c6f4ee0c386a4126cc3dcd23843920613fa1"
+MODEL_NAME = f"hf-hub:{MODEL_REPO}@{MODEL_REVISION}"
 MODEL_ID = "MegaDescriptor-L-384"
 IMAGE_SIZE = 384
 
@@ -16,7 +18,7 @@ IMAGE_SIZE = 384
 def is_model_cached() -> bool:
     """Check if model weights are already in the HuggingFace Hub cache."""
     for filename in ("model.safetensors", "pytorch_model.bin"):
-        result = try_to_load_from_cache(MODEL_REPO, filename)
+        result = try_to_load_from_cache(MODEL_REPO, filename, revision=MODEL_REVISION)
         if isinstance(result, str):
             return True
     return False
