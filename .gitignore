@@ -4,3 +4,4 @@ debug/
 __pycache__/
 *.pyc
 yolov8n.pt
+.venv/
