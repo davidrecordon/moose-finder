@@ -1,98 +1,84 @@
 # Moose Finder
 
-Automatically finds photos of Moose (a Bernese Mountain Dog) from Pet Camp's daily camper cameos.
+Finds photos of Moose (a Bernese Mountain Dog) in Pet Camp's daily camper cameos.
 
-## How It Works
+## How it works
 
-1. Scrapes the daily "Main Campground & Ranger Station" photos from [campercameos.com](https://campercameos.com)
-2. Detects individual dogs in each photo using YOLOv8n
-3. Compares each dog crop (plus the full image) against reference photos of Moose using MegaDescriptor embeddings
-4. Classifies results as match (>90%), uncertain (50-90%), or no match (<50%)
+1. **Download.** Looks up the day's "Main Campground & Ranger Station" page in the [campercameos.com](https://campercameos.com) sitemap and downloads its photos to `cache/<date>/`.
+2. **Find dogs.** YOLO26m boxes every dog in each photo.
+3. **Body match.** Each dog crop is embedded with a SigLIP2 model fine-tuned for animal identification and compared with known crops of Moose. This finds "a Bernese that could be Moose", but can't tell him from the other Bernese at camp.
+4. **Face check.** A small keypoint model finds the ears, nose and chin. When the dog is facing the camera, its face is cut out, embedded with DINOv3, and a classifier trained on Moose's face against the lookalikes' faces confirms or rejects. The white blaze between his eyes is narrower than theirs, and this is where that shows.
+5. **Verdict.** Each photo is one of:
+   - **Moose**: body matches and the face confirms it.
+   - **Possible**: body matches, no clear view of the face.
+   - **Lookalike**: body matches, but the face says it's another dog (counted, not listed).
 
-MegaDescriptor is a foundation model specifically designed for individual animal re-identification, trained on dog-specific datasets. Combined with YOLOv8n crop detection, it reliably identifies Moose even in multi-dog photos.
+Steps 2 to 4 are the slow part and are saved in `cache/<date>/features.npz`, so re-running a day, changing thresholds or retraining takes seconds.
 
 ## Setup
 
-### 1. Install Dependencies
+Needs [uv](https://docs.astral.sh/uv/). Everything else installs into a local `.venv`:
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/davidrecordon/moose-finder && cd moose-finder
+uv sync
 ```
 
-### 2. Add Reference Photos
-
-Place clear photos of Moose in `reference_photos/`. More photos covering different poses and angles improve accuracy. The current set includes 16 reference photos covering front-face, full body, side view, and outdoor poses.
-
-### 3. Run
-
-```bash
-python moose_finder.py
-```
+It uses an NVIDIA GPU if there is one, then Apple Silicon's GPU, then the CPU. The first run downloads about 1 GB of model weights.
 
 ## Usage
 
 ```bash
-# Check today's photos
-python moose_finder.py
-
-# Check a specific date
-python moose_finder.py --date 2026-02-01
-
-# Download images without analyzing
-python moose_finder.py --download-only
-
-# Only analyze already-cached images (no downloads)
-python moose_finder.py --analyze-only
-
-# Limit new downloads
-python moose_finder.py --download-limit 10
-
-# Show local status for a date (no downloads or analysis)
-python moose_finder.py --show-results
-python moose_finder.py --show-results --date 2026-02-03
-
-# Debug a single photo with full diagnostic breakdown
-python moose_finder.py --url "https://petcamp.s3.us-west-1.amazonaws.com/..."
+uv run python moose_finder.py                      # today
+uv run python moose_finder.py --date 2026-11-24    # one day
+uv run python moose_finder.py --since 2026-11-24   # every day since, through today
+uv run python moose_finder.py --since 2026-11-14 --until 2026-11-20
+uv run python moose_finder.py --no-download        # only photos already in cache/
+uv run python moose_finder.py --download-only      # fetch photos, don't analyse
+uv run python moose_finder.py --photo some.jpg     # explain every dog in one photo
 ```
 
-### Debug Mode
+Each day prints its matches with links, and writes `results/<date>.json` and a `results/<date>.html` gallery with the chosen dog boxed.
 
-The `--url` flag analyzes a single photo and shows the full diagnostic breakdown: per-reference similarity scores, YOLO detections with bounding boxes, crop dimensions, and saves all dog crops to `debug/` for visual inspection.
+Pet Camp usually posts in the afternoon or evening, San Francisco time. Running again later picks up only the new photos.
 
-```
-Full image similarity: 21% (best ref: moose_ref_4)
-  moose_ref_1:     6%
-  moose_ref_2:    21%
-  ...
+## Teaching it
 
-YOLOv8n detected 4 dog(s):
+The model learns from photo-level labels in `labels/labels.json`.
 
-  Dog 1: bbox [703, 593, 1177, 1105] conf=0.94, crop 559x614
-    Similarity: 26% (best ref: moose_ref_2)
-
-  Dog 3: bbox [118, 552, 608, 988] conf=0.83, crop 588x522
-    Similarity: 94% (best ref: moose_ref_15)  <- best
-
-Best overall: 94% (from detection_3) -> match
+```bash
+uv run python labeler.py          # label cached photos at http://127.0.0.1:8765
+uv run python train.py            # evaluate, then retrain and save models/moose_model.npz
+uv run python train.py --dry-run  # evaluate only
 ```
 
-## Tips
+In the labeller, click a photo if Moose is in it, use **Lookalike** for another dog you could mistake for him, and mark the rest of the page as not Moose. Lookalike labels matter as much as Moose labels: they are what the face classifier learns to reject.
 
-- Pet Camp usually posts photos in the afternoon/evening (SF time)
-- Add more reference photos for better accuracy, especially for poses where Moose is missed
-- Results are saved per-date, so re-running a date skips already-analyzed photos
-- Downloaded images are cached in `cache/` to avoid re-downloading
+`train.py` holds out one stay at a time, so every reported result comes from a model that never saw photos from that stay.
 
-## Troubleshooting
+## Files
 
-**"No photos found for this date"**
-- Photos might not be posted yet (usually by evening)
-- The URL format may have changed — check campercameos.com manually
+| File | Purpose |
+|---|---|
+| `moose_finder.py` | Command line: download, analyse, report |
+| `scraper.py` | Sitemap lookup and photo download |
+| `pipeline.py` | Dog detection, body and face embeddings, cached per date |
+| `matcher.py` | Body match plus face check; reads `models/moose_model.npz` |
+| `train.py` | Builds `models/moose_model.npz` from labels |
+| `labeler.py` | Local labelling page |
+| `models/dogpose-yolo26n.pt` | Dog keypoint model, trained on the Ultralytics dog-pose dataset |
+| `models/moose_model.npz` | Everything learned about Moose |
+| `reference_photos/` | Hand-picked starting photos of Moose |
 
-**"No reference photos found"**
-- Add photos of Moose to `reference_photos/`
+## Development
 
-**Moose not detected in a photo**
-- Use `--url` to debug the specific photo
-- If Moose is small in the background, YOLO may not detect it (known limitation)
-- If the crop is good but similarity is low, add the photo as a new reference to cover that pose
+```bash
+uv run pytest
+uv run black *.py tests
+uv run flake8 --select=F *.py tests
+```
+
+## Limits
+
+- Moose side-on or far in the background has no usable face, so those photos rely on the body match alone and land in "Possible" at best.
+- The face classifier only knows the dogs it has seen labelled. A new Bernese at camp may need a few Lookalike labels before it is rejected reliably.

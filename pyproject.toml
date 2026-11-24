@@ -1,0 +1,28 @@
+[project]
+name = "moose-finder"
+version = "0.2.0"
+description = "Finds photos of Moose the Bernese Mountain Dog in Pet Camp's daily photos"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "requests>=2.34.0",
+    "Pillow>=12.3.0",
+    "timm>=1.0.30",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "ultralytics>=8.4.173",
+    "transformers>=5.24.0",
+    "scikit-learn>=1.9.1",
+    "numpy>=2.5.5",
+]
+
+[dependency-groups]
+dev = [
+    "black",
+    "flake8",
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

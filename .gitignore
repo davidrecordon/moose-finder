@@ -1,7 +1,8 @@
 cache/
 results/
-debug/
 __pycache__/
 *.pyc
-yolov8n.pt
 .venv/
+.pytest_cache/
+# Downloaded automatically by Ultralytics on first run
+models/yolo26m.pt

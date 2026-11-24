@@ -2,124 +2,75 @@
 
 ## Project Overview
 
-Moose Finder is a Python script that scrapes daily pet daycare photos from campercameos.com and identifies photos containing a specific Bernese Mountain Dog named Moose using MegaDescriptor (purpose-built for individual animal re-identification) and YOLOv8n (dog detection for crop-then-re-ID).
+Moose Finder downloads Pet Camp's daily photos from campercameos.com and finds the ones containing Moose, a Bernese Mountain Dog. Several other Bernese attend the same camp, so it works in two stages: a body match finds Bernese that could be Moose, and a face check tells him from the lookalikes.
+
+Runs natively through a `uv` virtualenv (no Docker: Docker on macOS cannot use the GPU). Device is picked automatically: CUDA, then MPS, then CPU.
 
 ## Architecture
 
 ```
-moose_finder.py     # Main script: scraping, orchestration, CLI, output
-image_matcher.py    # MegaDescriptor embeddings for animal re-ID
-dog_detector.py     # YOLOv8n dog detection for crop-then-re-ID pipeline
+moose_finder.py   CLI: download, analyse, score, print, write results/<date>.json and .html
+scraper.py        Sitemap-based page lookup, photo download into cache/<date>/
+pipeline.py       Analyzer (4 models) -> Features, saved as cache/<date>/features.npz
+matcher.py        MooseModel: body similarity + face/body classifiers -> PhotoResult
+train.py          labels/labels.json + cached features -> models/moose_model.npz
+labeler.py        Local web page for labelling photos (stdlib only)
+tests/            pytest; no models or network needed
 ```
 
-### Detection Pipeline
+The split that matters: `pipeline.py` is slow and knows nothing about Moose; `matcher.py` and `train.py` are fast and only read saved features. Changing thresholds or retraining never re-runs the models.
 
-1. **YOLOv8n Detection**: Detects individual dogs in each photo, producing bounding box crops
-   - COCO class 16 (dog), confidence threshold 0.25, minimum area 1% of image
-   - 10% padding around each crop
-2. **MegaDescriptor Matching**: Full image + each crop compared against reference embeddings
-   - MegaDescriptor is a foundation model specifically designed for individual animal re-ID
-   - Trained on DogFaceNet and MPDD datasets, outperforms CLIP/DINOv2 on animal re-ID
-   - Best score across full image + all crops is used
-   - >= 0.90 similarity: match
-   - 0.50-0.90 similarity: uncertain
-   - < 0.50 similarity: rejected
+### Pipeline (pipeline.py)
 
-## Key Files
+1. **Detect**: YOLO26m, COCO class 16, imgsz 1280, conf 0.10, min box 0.15% of image area and 24 px a side. Item 0 of each photo is the full frame; crops get 10% padding.
+2. **Body embedding**: `AvitoTech/SigLIP2-Base-for-animal-identification` (pinned revision). Crops are squashed to 512x512 before the processor so nothing is centre-cropped away.
+3. **Face crop**: `models/dogpose-yolo26n.pt` predicts 24 keypoints per dog. The face box is the extent of ear bases, nose and chin scaled by 1.35, and requires nose and both ear bases at confidence 0.5 or more (the dataset has no eye labels). Faces under 24 px are not stored.
+4. **Face embedding**: timm `vit_base_patch16_dinov3.lvd1689m` (pinned revision) at 384 px.
 
-- `moose_finder.py` - Entry point, CLI args, web scraping, result display, `--url` debug mode
-- `image_matcher.py` - `ImageMatcher` class using MegaDescriptor-L-384, `get_debug_info()` for diagnostics
-- `dog_detector.py` - `DogDetector` class wrapping YOLOv8n, `DogDetection` dataclass with crop method
-- `reference_photos/` - Reference images of Moose (currently 16 photos covering various poses)
-- `cache/` - Downloaded image cache (MD5-hashed filenames)
-- `results/` - Per-date JSON files with analysis results (for resumability)
-- `debug/` - YOLO crop images from `--url` debug mode
+`FEATURES_VERSION` must be bumped when any of this changes; older feature files are then rebuilt.
 
-## Dependencies
+### Matching (matcher.py)
 
-- `timm` - PyTorch Image Models, loads MegaDescriptor from HuggingFace
-- `torch`, `torchvision` - PyTorch framework
-- `ultralytics` - YOLOv8n dog detection
-- `requests`, `beautifulsoup4` - Web scraping
-- `Pillow` - Image processing
+Per item: `similarity` = max cosine to the body references. Items at or above `candidate_similarity` are candidates. A candidate with a usable face (at least `min_face_side` px) is `match` or `lookalike` by the face classifier; one without is `possible` if the body classifier agrees. A photo takes its strongest item. Settings live in `DEFAULT_SETTINGS` and are saved inside the model file.
 
-## Common Commands
+### Training (train.py)
+
+Labels are per photo. Training picks the crop the label refers to (best body match, two passes), then builds body references from Moose crops and fits two logistic regressions (face C=100, body C=10) against hard negatives: any crop with body similarity 0.75 or more in a photo labelled lookalike or not_moose. Evaluation is leave-one-stay-out (dates within 3 days of each other form a stay).
+
+Current settings (`matcher.DEFAULT_SETTINGS`, chosen from held-out sweeps): `candidate_similarity` 0.85, `face_threshold` 0.6, `body_threshold` 0.6, `min_face_side` 40. The classifiers are not calibrated to 0.5: with weaker regularisation (C=1) face probabilities bunch around 0.5 to 0.7 and lookalikes pass, so re-sweep thresholds if C changes.
+
+### Data and results (as of 2026-11-23)
+
+- `cache/` holds 16,530 photos from 113 days across every stay since Feb 2025 (not in git). `labels/labels.json` has 1,246 labelled photos: 105 moose, 200 lookalike, 941 not_moose.
+- Nov 14 to 20, 2026 is the only period where every photo is labelled, so it is the honest test set. Earlier stays have labels only for photos some version of the tool nominated.
+- Held-out on the test week: of 8 Moose photos, 4 match, 2 possible, 2 missed; 0 of 784 other photos called a match.
+- Checked by hand on unlabelled history: "match" was right 11 of 12 times, face rejections were right 147 of 150, but "possible" was Moose only 4 of 46 times. Without a visible face the body embedding cannot separate the Bernese; more labels did not help. A second marking-based check (side of head, chest) is the untried idea.
+- The hand-picked `reference_photos/` come from earlier stays, so those stays are not clean test data.
+
+## Commands
 
 ```bash
-# Run detection for today
-python moose_finder.py
-
-# Run for specific date
-python moose_finder.py --date 2026-02-03
-
-# Only process cached images (no downloads)
-python moose_finder.py --analyze-only
-
-# Download images without analyzing
-python moose_finder.py --download-only
-
-# Limit new downloads
-python moose_finder.py --download-limit 10
-
-# Show local status for a date (no downloads or analysis)
-python moose_finder.py --show-results
-python moose_finder.py --show-results --date 2026-02-03
-
-# Debug a single photo with full diagnostic breakdown
-python moose_finder.py --url "https://petcamp.s3.us-west-1.amazonaws.com/..."
-
-# Format code
-black moose_finder.py image_matcher.py dog_detector.py
-
-# Lint (F-codes are errors; E501 line length is handled by black)
-flake8 --select=F moose_finder.py image_matcher.py dog_detector.py
-
-# Syntax check
-python -m py_compile moose_finder.py && python -m py_compile image_matcher.py && python -m py_compile dog_detector.py
+uv sync
+uv run python moose_finder.py [--date D | --since D [--until D]] [--no-download] [--download-only]
+uv run python moose_finder.py --photo path.jpg
+uv run python labeler.py [--order list.json [--only]]
+uv run python train.py [--dry-run]
+uv run pytest
+uv run black *.py tests
+uv run flake8 --select=F *.py tests
 ```
 
-## Thresholds
+## Site facts
 
-Defined in `image_matcher.py`:
-- Match threshold: 0.90 (high confidence)
-- Uncertain threshold: 0.50 (low confidence boundary)
-
-Defined in `dog_detector.py`:
-- YOLO confidence: 0.25
-- Minimum crop area: 1% of image
-
-## URL Patterns
-
-Pet Camp posts photos at URLs like:
-- `/main-campground-and-ranger-station-february-3rd-2026/`
-- `/main-campground-ranger-station-january-25-2026/`
-- Variations with/without "and", ordinal/plain day numbers
+- Daily pages are WordPress posts with inconsistent slugs (weekday names, `pet-camp-` prefix, `main-and-ranger-station`, `-2` duplicates). `scraper.slug_date` accepts any slug containing "main", not "cat", ending in `-<month>-<day>[st|nd|rd|th]-<year>[-N]`.
+- `https://campercameos.com/wp-sitemap-posts-post-{1..N}.xml` lists every post back to 2018. Guessed URLs are a fallback for pages too new for the sitemap.
+- Photos are on `https://petcamp.s3.us-west-1.amazonaws.com/`; thumbnails carry a `-WxH` suffix that is stripped to get the original.
 
 ## Notes
 
-- Photos are typically posted in the afternoon/evening SF time
-- Images are cached by URL hash to avoid re-downloading
-- Results are saved per-date as JSON for resumability — re-running skips already-analyzed photos
-- The MegaDescriptor model downloads on first run (~400MB for L-384)
-- YOLOv8n weights (yolov8n.pt) download on first run (~6.5MB)
-- Known limitation: Moose in the background (<10% of frame) typically won't match due to small crop resolution
-- Another Bernese Mountain Dog at the same daycare can score up to ~58% — the 0.90 threshold prevents false matches
-
-## Future Features
-
-These features were previously implemented and removed to keep the codebase focused. Notes for re-adding:
-
-### Email Notifications
-- Needs `smtplib` and `email.mime.multipart`/`email.mime.text`/`email.mime.image` imports
-- Add `config.json` with SMTP credentials (`email_from`, `email_to`, `smtp_server`, `smtp_port`, `smtp_username`, `smtp_password`)
-- Add `--send-email` and `--setup-email` CLI args
-- Implement `load_config()`, `save_config()`, `send_email()`, `setup_email()` functions
-- Add `config.json` to `.gitignore`
-
-### Claude Vision Fallback
-- Needs `anthropic` package (`pip install anthropic`)
-- Create `claude_vision.py` with `verify_with_claude()` function that sends reference + candidate images to Claude
-- Route uncertain matches (0.50-0.90 similarity) to Claude for verification
-- Add `--no-claude` flag to disable API fallback
-- Requires `ANTHROPIC_API_KEY` environment variable
-- Claude confirmation threshold was 0.70
+- Models tried and rejected for the body stage: MegaDescriptor-L-384 (the original; scores collapsed on new photos), MiewID, DINOv3, open-noodle pet-recognition, SigLIP2-giant (no better, far slower). For faces, DINOv3 beat SigLIP2 and MegaDescriptor.
+- The keypoint model was trained with `yolo pose train data=dog-pose.yaml model=yolo26n-pose.pt epochs=30 imgsz=512 batch=16` (about 1.5 hours on an M5 Pro; larger batches exhaust MPS memory).
+- Licences: Ultralytics (and the keypoint weights trained with it) is AGPL-3.0; the SigLIP2 model is Apache-2.0. The repo itself has no licence file yet.
+- `scraper.py`'s download path was rewritten from the scratch scripts used to fill `cache/`; check it against the live site when changing it.
+- `models/yolo26m.pt` is gitignored and re-downloaded by Ultralytics; `models/dogpose-yolo26n.pt` and `models/moose_model.npz` are meant to be committed so another machine can run without retraining.
+- Commit only when asked.
